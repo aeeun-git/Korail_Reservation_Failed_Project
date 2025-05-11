@@ -84,7 +84,7 @@ def build_model(hp):
     model = Model(inp, out)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        loss='mean_squared_error', metrics=['mae']
+        loss='mse', metrics=['mae']
     )
     model._batch_size = batch_size
     return model
