@@ -31,7 +31,7 @@ df['depart_dt'] = pd.to_datetime(
 )
 
 # OD 지정
-single_od = '서울_대전'
+single_od = '서울_오송'
 df = df[df['OD'] == single_od].sort_values('depart_dt')
 
 ts_fail = df.set_index('depart_dt')['예약실패건수']
@@ -98,7 +98,7 @@ scaled = scaler_raw.transform(raw_log).flatten()
 # 시퀀스 만들기
 X, y = make_sequences(scaled, feat_scaled, lag_df)
 times   = ts_fail.index[SEQ_LEN:]
-split_dt = pd.to_datetime('2024-12-14')
+split_dt = pd.to_datetime('2024-11-20')
 mask    = times >= split_dt
 X_train, X_test = X[~mask], X[mask]
 y_train, y_test = y[~mask], y[mask]
@@ -163,5 +163,5 @@ out = pd.DataFrame({
     'pred':      pred_orig
 })
 out['OD'] = single_od
-out.to_csv('predictions_대전2.csv', index=False)
-print("완료: predictions_대전2.csv")
+out.to_csv('predictions_오송3.csv', index=False)
+print("완료: predictions_오송3.csv")
