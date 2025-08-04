@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler,MinMaxScaler
 from torch.optim.lr_scheduler import StepLR
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
@@ -12,12 +12,10 @@ import matplotlib.dates as mdates
 from unidecode import unidecode
 import duckdb
 
-# ─────────────────────────────────────────────────────────────
-# 1) 하이퍼파라미터 & lag 설정
-# ─────────────────────────────────────────────────────────────
+# 하이퍼파라미터 & lag 설정
 DATA_PATH      = "final.csv"
 SEQ_LEN        = 96       # 과거 12시간(15분 간격 96스텝)
-HORIZON_STEPS  = 4        # 1시간 뒤 (15분*4 스텝)
+HORIZON_STEPS  = 1        # 1시간 뒤 (15분*4 스텝)
 PRED_LEN       = 1        # 예측 1지점
 BATCH_SIZE     = 32
 EPOCHS         = 100
@@ -32,9 +30,7 @@ STEPS_PER_WEEK = 7 * STEPS_PER_DAY
 
 TEST_START = pd.to_datetime("20241120", format="%Y%m%d")
 
-# ─────────────────────────────────────────────────────────────
-# 2) 데이터 로딩 및 전처리
-# ─────────────────────────────────────────────────────────────
+# 데이터 로딩 및 전처리
 assert os.path.exists(DATA_PATH), f"{DATA_PATH} not found."
 df = pd.read_csv(DATA_PATH, dtype=str).rename(columns={
     "출발역":"ori","도착역":"dst",
@@ -100,15 +96,14 @@ def make_sequences(arr: np.ndarray, seq_len: int, horizon: int, pred_len: int):
     return np.array(X), np.array(y)
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, X,y,w):
-        self.X, self.y, self.w = X,y,w
+    def __init__(self, X,y):
+        self.X, self.y = X,y
     def __len__(self):
         return len(self.X)
     def __getitem__(self, i):
         return (
             torch.tensor(self.X[i], dtype=torch.float32),
-            torch.tensor(self.y[i], dtype=torch.float32),
-            torch.tensor(self.w[i], dtype=torch.float32)
+            torch.tensor(self.y[i], dtype=torch.float32)
         )
 
 class AttentionGRU(nn.Module):
@@ -133,113 +128,159 @@ class AttentionGRU(nn.Module):
         return self.fc2(torch.relu(self.fc1(cat)))
 
 def train_one_od(ori: str, dst: str):
-    sub = df[(df.ori==ori)&(df.dst==dst)].copy()
-    if len(sub) < SEQ_LEN + HORIZON_STEPS:
+    # 데이터 필터링
+    sub = df[(df.ori==ori)&(df.dst==dst)].sort_values("datetime").copy()
+    if len(sub) < SEQ_LEN + 96:
         return None
 
-    df_feat = make_feature_df(sub)
-    dates   = df_feat.index
-    mask_tv, mask_test = dates<TEST_START, dates>=TEST_START
+    ts = sub.set_index('datetime')['fail_count']
+    cols_to_fill = [
+        "dow_sin","dow_cos","is_weekend","is_holiday",
+        "before_holiday","after_holiday","temperature","precipitation","snowfall"
+    ]
+    feat = sub.drop_duplicates('datetime').set_index('datetime')[cols_to_fill]
 
-    scaler_f = StandardScaler().fit(df_feat.loc[mask_tv, FEATURE_COLS])
-    scaler_t = StandardScaler().fit(df_feat.loc[mask_tv, ["fail_count"]])
-    arr_f    = scaler_f.transform(df_feat[FEATURE_COLS])
-    arr_t    = scaler_t.transform(df_feat[["fail_count"]])
+    # Lag 피처 생성
+    STEPS_PER_DAY = 24 * 4
+    STEPS_PER_WEEK = 7 * STEPS_PER_DAY
+    lag = pd.DataFrame(index=ts.index)
+    for d in range(1, 8): lag[f'lag{d}d'] = ts.shift(d * STEPS_PER_DAY)
+    for w in range(1, 4): lag[f'lag{w}w'] = ts.shift(w * STEPS_PER_WEEK)
+    lag['avg3d'] = lag[[f'lag{d}d' for d in range(1, 4)]].mean(axis=1)
+    lag['avg7d'] = lag[[f'lag{d}d' for d in range(1, 8)]].mean(axis=1)
+    lag.fillna(0, inplace=True)
 
-    X_all, _ = make_sequences(arr_f, SEQ_LEN, HORIZON_STEPS, PRED_LEN)
-    _, y_all = make_sequences(arr_t, SEQ_LEN, HORIZON_STEPS, PRED_LEN)
-    y_all    = y_all.squeeze(-1)   # (N_seq,)
+    # Feature 스케일링
+    scaler_feat = MinMaxScaler()
+    feat_s = pd.DataFrame(
+        scaler_feat.fit_transform(feat),
+        index=feat.index, columns=feat.columns
+    ).fillna(0)
 
-    offset      = SEQ_LEN + HORIZON_STEPS - 1
-    seq_dates   = dates[offset:]
-    w_all       = df_feat["is_weekend"].replace({0:1,1:1.2}).values[offset:]
+    # Target 스케일링
+    raw_log = np.log1p(ts.values).reshape(-1, 1)
+    scaler_raw = MinMaxScaler().fit(raw_log)
+    scaled = scaler_raw.transform(raw_log).flatten()
 
-    mask_seq_tv   = seq_dates<TEST_START
-    mask_seq_test = seq_dates>=TEST_START
+    # 시퀀스 데이터 생성
+    X, y = [], []
+    for i in range(len(scaled) - SEQ_LEN):
+        seq = scaled[i:i+SEQ_LEN].reshape(-1, 1)
+        # fail_count 시퀀스 + 외부피처 시퀀스 + lag피처 시퀀스
+        X.append(np.hstack([
+            seq,
+            feat_s.iloc[i:i+SEQ_LEN].values,
+            lag.iloc[i:i+SEQ_LEN].values
+        ]))
+        y.append(scaled[i+SEQ_LEN])
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
+    
+    times = ts.index[SEQ_LEN:]
+    mask = times >= TEST_START
+    X_train, X_test = X[~mask], X[mask]
+    y_train, y_test = y[~mask], y[mask]
+    
+    test_dates_seq = times[mask]
 
-    X_tv, y_tv, w_tv = X_all[mask_seq_tv], y_all[mask_seq_tv], w_all[mask_seq_tv]
-    split = int(len(X_tv)*0.8)
-    X_tr, y_tr, w_tr = X_tv[:split], y_tv[:split], w_tv[:split]
-    X_val,y_val,w_val= X_tv[split:],y_tv[split:],w_tv[split:]
-    X_test,y_test,w_test = X_all[mask_seq_test], y_all[mask_seq_test], w_all[mask_seq_test]
-    test_dates_seq      = seq_dates[mask_seq_test]
+    # train/validation 분할
+    split = int(len(X_train) * 0.8)
+    X_tr, y_tr = X_train[:split], y_train[:split]
+    X_val, y_val = X_train[split:], y_train[split:]
 
-    tr_loader  = DataLoader(TimeSeriesDataset(X_tr, y_tr, w_tr), batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(TimeSeriesDataset(X_val, y_val, w_val), batch_size=BATCH_SIZE)
-    test_loader= DataLoader(TimeSeriesDataset(X_test, y_test, w_test), batch_size=BATCH_SIZE)
+    # DataLoader 생성
+    tr_loader = DataLoader(TimeSeriesDataset(X_tr, y_tr), batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(TimeSeriesDataset(X_val, y_val), batch_size=BATCH_SIZE)
+    test_loader = DataLoader(TimeSeriesDataset(X_test, y_test), batch_size=BATCH_SIZE)
 
-    model = AttentionGRU(X_all.shape[2], 128, 32, PRED_LEN, num_layers=2).to(DEVICE)
-    opt   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    sched = StepLR(opt, step_size=5, gamma=0.5)
-    crit  = nn.MSELoss(reduction="none")
+    model = AttentionGRU(X.shape[2], 128, 32, PRED_LEN, num_layers=2).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    crit  = nn.MSELoss() 
 
     train_ls, val_ls, best, cnt_no_imp = [], [], 1e9, 0
+
+    # 조기종료 세팅 val loss가 이만큼 이상 개선될 때만 '개선'으로 간주
+    PATIENCE    = 5       # val 개선 없을 때 몇 epoch까지 버틸지
+    MIN_DELTA   = 1e-4    # 이보다 작으면 개선으로 간주하지 않음
+    train_ls, val_ls = [], []
+    best_val   = float('inf')
+    no_imp_cnt = 0
+    
     for ep in range(1, EPOCHS+1):
         # --- train ---
         model.train()
-        tot,ct=0,0
-        for xb,yb,wb in tr_loader:
+        tot, ct = 0, 0
+        for xb, yb in tr_loader:
             xb = xb.to(DEVICE)
-            yb = yb.to(DEVICE).squeeze(-1)      # ← yb: [batch,1] → [batch]
-            wb = wb.to(DEVICE).unsqueeze(1)
+            yb = yb.to(DEVICE).squeeze(-1)
             opt.zero_grad()
-            pred = model(xb).squeeze(-1)         # pred: [batch]
-            loss = (crit(pred, yb)*wb).mean()
-            loss.backward(); opt.step()
-            tot+=loss.item()*xb.size(0); ct+=xb.size(0)
+            pred = model(xb).squeeze(-1)
+            loss = crit(pred, yb)
+            loss.backward()
+            opt.step()
+            tot += loss.item() * xb.size(0)
+            ct  += xb.size(0)
         train_ls.append(tot/ct)
 
-        # --- val ---
+        # --- validation ---
         model.eval()
-        tot,ct=0,0
+        tot, ct = 0, 0
         with torch.no_grad():
-            for xb,yb,wb in val_loader:
+            for xb, yb in val_loader:
                 xb = xb.to(DEVICE)
-                yb = yb.to(DEVICE).squeeze(-1)  # ← 여기도 동일
-                wb = wb.to(DEVICE).unsqueeze(1)
-                p  = model(xb).squeeze(-1)
-                l  = (crit(p, yb)*wb).mean()
-                tot+=l.item()*xb.size(0); ct+=xb.size(0)
-        val_ls.append(tot/ct)
+                yb = yb.to(DEVICE).squeeze(-1)
+                pred = model(xb).squeeze(-1)
+                loss = crit(pred, yb)
+                tot += loss.item() * xb.size(0)
+                ct += xb.size(0)
+        val_loss = tot / ct
+        val_ls.append(val_loss)
 
-        print(f"[{ori}->{dst}] Ep{ep} tr={train_ls[-1]:.4f} val={val_ls[-1]:.4f}")
-        if val_ls[-1] < best:
-            best, cnt_no_imp = val_ls[-1], 0
+        curr_val = val_ls[-1]
+        print(f"[{ori}->{dst}] Ep{ep}  train={train_ls[-1]:.4f}  val={curr_val:.4f}")
+
+        # Early stopping
+        if best_val - curr_val > MIN_DELTA:
+            best_val = curr_val
+            no_imp_cnt = 0
         else:
-            cnt_no_imp += 1
-            if cnt_no_imp >= 15:
-                print("Early stopping"); break
-        sched.step()
+            no_imp_cnt += 1
+            if no_imp_cnt >= PATIENCE:
+                print(f"Early stopping at epoch {ep}  (no val-improve for {PATIENCE} epochs)")
+                break
+    
+    
+    # Test 예측 & 복원
+    model.eval()
+    preds, acts = [], []
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(DEVICE)
+            out = model(xb).squeeze(-1).cpu().numpy()
+            preds.append(out)
+            acts.append(yb.numpy())
+    preds_arr = np.concatenate(preds, axis=0)
+    acts_arr = np.concatenate(acts, axis=0)
+    preds_flat = scaler_raw.inverse_transform(preds_arr.reshape(-1,1)).flatten()
+    acts_flat  = scaler_raw.inverse_transform(acts_arr.reshape(-1,1)).flatten()
+    preds_flat = np.expm1(preds_flat)
+    acts_flat  = np.expm1(acts_flat)
+    actual_int = np.round(acts_flat).astype(int)
 
-    # --- Loss Curve ---
+
+    # Loss Curve
     dep, arr = unidecode(ori), unidecode(dst)
-    os.makedirs("10OD/loss", exist_ok=True)
+    os.makedirs("models_gru_final_96/loss", exist_ok=True)
     plt.figure(figsize=(6,4))
     plt.plot(train_ls, label="Train Loss")
     plt.plot(val_ls,   label="Val Loss")
     plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
     plt.title(f"{dep} → {arr} Loss"); plt.legend(); plt.grid()
-    plt.savefig(f"10OD/loss/{ori}_{dst}_loss.png", dpi=300, bbox_inches="tight")
+    plt.savefig(f"models_gru_final_96/loss/{ori}_{dst}_loss.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # --- Test 예측 & 복원 ---
-    model.eval()
-    preds, acts = [], []
-    with torch.no_grad():
-        for xb,yb,_ in test_loader:
-            xb = xb.to(DEVICE)
-            out= model(xb).squeeze(-1).cpu().numpy()
-            preds.append(out); acts.append(yb.numpy())
-    preds_arr  = np.concatenate(preds, axis=0)
-    acts_arr   = np.concatenate(acts,  axis=0)
-    preds_flat = scaler_t.inverse_transform(preds_arr.reshape(-1,1)).flatten()
-    acts_flat  = scaler_t.inverse_transform(acts_arr.reshape(-1,1)).flatten()
-    actual_int = np.round(acts_flat).astype(int)
-
-    # --- 예측 시각 = 기준 시각 + 1시간 ---
     test_dates = test_dates_seq + np.timedelta64(HORIZON_STEPS*15, 'm')
 
-    # --- 서비스 시간 필터링 ---
     df_pred = pd.DataFrame({
         "datetime":  test_dates,
         "ori":       ori,
@@ -251,8 +292,8 @@ def train_one_od(ori: str, dst: str):
     mask = ((dt.dt.hour >= 5)&(dt.dt.hour <= 23)) | ((dt.dt.hour==0)&(dt.dt.minute<=45))
     df_pred = df_pred.loc[mask].reset_index(drop=True)
 
-    # --- GT/Pred 플롯 ---
-    os.makedirs("10OD/plots", exist_ok=True)
+    # GT/Pred 플롯
+    os.makedirs("models_gru_final_96/plots", exist_ok=True)
     fig,(ax1,ax2) = plt.subplots(2,1,sharex=True,sharey=True,figsize=(12,6),gridspec_kw={'hspace':0.4})
     ax1.plot(df_pred["datetime"], df_pred["actual"],    color='gray',    linewidth=1, label='GT')
     ax1.set_title(f"{dep} → {arr} GT");   ax1.set_ylabel("Fail Count"); ax1.legend()
@@ -262,27 +303,26 @@ def train_one_od(ori: str, dst: str):
     ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     fig.autofmt_xdate(rotation=45)
     plt.tight_layout()
-    plt.savefig(f"10OD/plots/{ori}_{dst}_gt_pred.png", dpi=300)
+    plt.savefig(f"models_gru_final_96/plots/{ori}_{dst}_gt_pred.png", dpi=300)
     plt.close()
 
-    # --- CSV 저장 ---
-    os.makedirs("10OD/prediction", exist_ok=True)
-    df_pred.to_csv(f"10OD/prediction/{ori}_{dst}.csv", index=False, encoding="utf-8-sig")
+    os.makedirs("models_gru_final_96/prediction", exist_ok=True)
+    df_pred.to_csv(f"models_gru_final_96/prediction/{ori}_{dst}.csv", index=False, encoding="utf-8-sig")
 
-    # --- 지표 계산 & 반환 ---
+    # 지표 계산 & 반환
     y_true = df_pred["actual"].values
     y_pred = df_pred["predicted"].values
     mse  = mean_squared_error(y_true, y_pred)
     rmse = np.sqrt(mse)
     mae  = mean_absolute_error(y_true, y_pred)
     nz   = y_true > 0
-    mape = np.mean(np.abs((y_true[nz] - y_pred[nz]) / y_true[nz])) if nz.any() else np.nan
+    mape = (np.mean(np.abs((y_true[nz] - y_pred[nz]) / y_true[nz]))*100) if nz.any() else np.nan
     print(f"[{ori}->{dst}] MSE={mse:.4f}, RMSE={rmse:.4f}, MAE={mae:.4f}, MAPE={mape:.4f}")
 
     return {
         "state_dict":    model.state_dict(),
-        "scaler_feat":   scaler_f,
-        "scaler_target": scaler_t,
+        "scaler_feat":   scaler_feat,
+        "scaler_target": scaler_raw,
         "mse":           mse,
         "rmse":          rmse,
         "mae":           mae,
@@ -290,15 +330,34 @@ def train_one_od(ori: str, dst: str):
     }
 
 if __name__ == "__main__":
-    od_pairs = [
-        ("서울","대전"),("대전","서울"),
-        ("서울","동대구"),("동대구","서울"),
-        ("서울","부산"),("부산","서울"),
-        ("광명","동대구"),("광명","대전"),
-        ("서울","천안아산"),("수원","영등포"),
+    target_od_pairs = [
+        ('동대구', '서울'),    ('부산', '서울'),    ('대전', '서울'),    ('서울', '대전'),
+        ('서울', '동대구'),    ('서울', '부산'),    ('동대구', '광명'),    ('광주송정', '용산'),
+        ('울산', '서울'),    ('서울', '오송'),    ('부산', '광명'),    ('용산', '광주송정'),
+        ('오송', '서울'),    ('서울', '천안아산'),    ('서울', '울산'),    ('대전', '광명'),
+        ('천안아산', '서울'),    ('익산', '용산'),    ('광명', '대전'),    ('광명', '동대구'),
+        ('동대구', '천안아산'),    ('김천구미', '서울'),    ('용산', '익산'),    ('광명', '부산'),
+        ('전주', '용산'),    ('용산', '오송'),    ('경주', '서울'),    ('오송', '용산'),
+        ('부산', '천안아산'),    ('용산', '전주'),    ('부산', '대전'),    ('광명', '오송'),
+        ('용산', '천안아산'),    ('대전', '영등포'),    ('동대구', '대전'),    ('울산', '광명'),
+        ('동대구', '오송'),    ('서울', '김천구미'),    ('부산', '오송'),    ('창원중앙', '서울'),
+        ('광주송정', '서울'),    ('광주송정', '광명'),    ('순천', '용산'),    ('영등포', '대전'),
+        ('오송', '광명'),    ('천안아산', '용산'),    ('서울', '경주'),    ('광명', '광주송정'),
+        ('용산', '순천'),    ('익산', '광명')
     ]
+    df_target = pd.DataFrame(target_od_pairs, columns=['ori', 'dst'])
+
+    od_fail = df.groupby(["ori", "dst"])["fail_count"].sum().reset_index()
+
+    merged_df = pd.merge(df_target, od_fail, on=['ori', 'dst'], how='inner')
+    final_pairs_df = merged_df[merged_df['fail_count'] >= 1000]
+
+    final_od_pairs = list(final_pairs_df[['ori', 'dst']].itertuples(index=False, name=None))
+    
+    print(f"지정된 리스트 중 실패 건수 1000건 이상인 OD쌍 개수: {len(final_od_pairs)}")
+
     metrics = []
-    for ori,dst in od_pairs:
+    for ori, dst in final_od_pairs:
         print(f"=== {ori} → {dst} ===")
         res = train_one_od(ori, dst)
         if res:
@@ -308,9 +367,9 @@ if __name__ == "__main__":
                 "mae": res["mae"], "mape": res["mape"]
             })
 
-    # DuckDB에 저장
-    os.makedirs("10OD", exist_ok=True)
-    con = duckdb.connect("10OD/results.duckdb")
+    # DuckDB 저장
+    os.makedirs("models_gru_final_96", exist_ok=True)
+    con = duckdb.connect("models_gru_final_96/results.duckdb")
     dfm = pd.DataFrame(metrics)
     con.execute("CREATE TABLE IF NOT EXISTS metrics_summary AS SELECT * FROM dfm")
     con.execute("""
@@ -319,8 +378,8 @@ if __name__ == "__main__":
             actual INTEGER, predicted DOUBLE
         )
     """)
-    for ori,dst in od_pairs:
-        path = f"10OD/prediction/{ori}_{dst}.csv"
+    for ori,dst in final_od_pairs:
+        path = f"models_gru_final_96/prediction/{ori}_{dst}.csv"
         if os.path.exists(path):
             dd = pd.read_csv(path, parse_dates=["datetime"])
             con.register("tmp", dd)
@@ -330,5 +389,5 @@ if __name__ == "__main__":
                 FROM tmp
             """)
             con.unregister("tmp")
-    dfm.to_csv("10OD/metrics_summary.csv", index=False, encoding="utf-8-sig")
+    dfm.to_csv("models_gru_final_96/metrics_summary.csv", index=False, encoding="utf-8-sig")
     con.close()
